@@ -4,7 +4,7 @@
 
 chat_dream.py：简单的与dream模型的对话示例。
 code_dream.py：使用dream模型对数据集进行测试评估的代码。
-model文件夹下是dream相关代码。
+model文件夹下是dream相关代码（fast-dllm改进版），model_origin文件夹下面是原生dream代码。
 model/init.py：初始化model包，便于模块导入。
 model/configuration_dream.py：定义模型的配置参数和配置类。
 model/generation_utils_block.py：实现分块生成相关的辅助工具函数。
