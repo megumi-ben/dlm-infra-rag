@@ -1,4 +1,5 @@
-# Copyright 2025 NVIDIA CORPORATION & AFFILIATES
+# coding=utf-8
+# Copyright 2024 The Dream team, HKUNLP Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,12 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# SPDX-License-Identifier: Apache-2.0
 
-# Modified from Dream repos: https://github.com/HKUNLP/Dream
-
-import time
 import warnings
 import copy
 from dataclasses import dataclass
@@ -34,8 +30,11 @@ from transformers.utils import (
     is_torchdynamo_compiling,
     logging,
 )
-
+from typing import List
 logger = logging.get_logger(__name__)
+
+
+import time
 
 
 def top_p_logits(logits, top_p=None):
@@ -94,11 +93,69 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
     return confidence, x0
 
 
+
+def add_gumbel_noise(logits, temperature, gumbel_noise=None):
+
+    if temperature == 0:
+        return logits, None
+    
+    if gumbel_noise is None:
+        logits = logits.to(torch.float64)
+        noise = torch.rand_like(logits, dtype=torch.float64)
+        gumbel_noise = (- torch.log(noise)) ** temperature
+        return logits.exp() / gumbel_noise, gumbel_noise
+    else:
+        return logits.exp() / gumbel_noise, gumbel_noise
+
+def sample_with_gumbel(logits, gumbel_noise=None, temperature=0.0, top_p=None, top_k=None):
+
+    if temperature > 0:
+        logits = logits / temperature
+    if top_p is not None and top_p < 1:
+        logits = top_p_logits(logits, top_p)
+    if top_k is not None:
+        logits = top_k_logits(logits, top_k)
+    
+
+    logits_with_noise, gumbel_noise = add_gumbel_noise(logits, temperature, gumbel_noise)
+    x0 = torch.argmax(logits_with_noise, dim=-1)
+        
+    return gumbel_noise, x0
+
+
+def apd_accept_criterion(x, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight):
+    if x.shape[-1] > diffusion_logits.shape[1]:
+        x = x[:, -diffusion_logits.shape[1]:]
+    if verifier_logits.shape[1] > diffusion_logits.shape[1]:
+        verifier_logits = verifier_logits[:, -diffusion_logits.shape[1]:, :]
+        
+    target = apd_mixture_weight * diffusion_logits + (1-apd_mixture_weight) * verifier_logits
+    _, target_samples = sample_with_gumbel(target, gumbel_noise=gumbel_noise)
+    
+    accept = x == target_samples
+    accept[:, 0] = 1
+    accept = torch.cumprod(accept, dim=-1)
+    return accept
+
 @dataclass
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
-    nfe: Optional[int] = None # Added NFE field
+    
+@dataclass
+class ProfileOutput(ModelOutput):
+    num_forward_evals: int = None
+    num_tokens_generated: int = None
+    verification_time: float = None
+    total_time: float = None
+    acceptance_counts: List[int] = None
+    
+    
+@dataclass
+class DreamModelOutputWithProfile(ModelOutput):
+    sequences: torch.LongTensor = None
+    history: Optional[Tuple[torch.FloatTensor]] = None
+    profile: Optional[ProfileOutput] = None
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -113,6 +170,12 @@ class DreamGenerationConfig(GenerationConfig):
         self.steps: int = kwargs.pop("steps", 512)
         self.alg: str = kwargs.pop("alg", 'origin')
         self.alg_temp: Optional[float] = kwargs.pop("alg_temp", None)
+        # Diffusion parameters (canonical names)
+        self.tokens_per_step: Optional[int] = kwargs.pop("tokens_per_step", None)
+        self.kv_window: Optional[int] = kwargs.pop("kv_window", None)
+        self.max_lookahead: Optional[int] = kwargs.pop("max_lookahead", None)
+        self.apd_mixture_weight: Optional[float] = kwargs.pop("apd_mixture_weight", None)
+        
 
         # Parameters that define the output variables of `generate`
         self.num_return_sequences: int = kwargs.pop("num_return_sequences", 1)
@@ -124,6 +187,7 @@ class DreamGenerationConfig(GenerationConfig):
         self.pad_token_id = kwargs.pop("pad_token_id", None)
         self.bos_token_id = kwargs.pop("bos_token_id", None)
         self.eos_token_id = kwargs.pop("eos_token_id", None)
+        
 
         # Wild card
         self.generation_kwargs = kwargs.pop("generation_kwargs", {})
@@ -260,6 +324,7 @@ class DreamGenerationMixin:
         """
         Prepares the special tokens for generation, overwriting the generation config with their processed versions
         converted to tensor.
+
         Note that `generation_config` is changed in place and stops being serializable after this method is called.
         That is no problem if called within `generate` (`generation_config` is a local copy that doesn't leave the
         function). However, if called outside `generate`, consider creating a copy of `generation_config` first.
@@ -298,128 +363,17 @@ class DreamGenerationMixin:
         generation_config._pad_token_tensor = pad_token_tensor
         generation_config._mask_token_tensor = mask_token_tensor
 
-    # [NEW FUNCTION] 封装热启动初始化逻辑
-    def initialize_with_kickstart(
-        self,
-        x: torch.LongTensor,
-        prompt_len: int,
-        kickstart_ids: Optional[torch.Tensor],
-        kickstart_strength: float,
-        kickstart_threshold: float,
-        projection_type: str,
-        mask_token_id: int,
-        pad_token_id: Optional[int], # NEW argument
-        attention_mask: Optional[torch.Tensor],
-        tok_idx: Optional[torch.Tensor],
-        steps: int
-    ) -> Tuple[torch.LongTensor, float, int]:
-        """
-        处理 RAG 热启动逻辑：注入草稿、评估置信度、执行重掩码。
-        返回初始化后的画布 x, 初始 Mask 比例, 以及消耗的 NFE。
-        """
-        # 默认初始状态：全 Mask，比例为 1.0
-        initial_mask_ratio = 1.0
-        nfe_cost = 0
-        
-        # 如果没有草稿或强度为 1.0（全重绘），直接返回全 Mask 的 x
-        if kickstart_ids is None or kickstart_strength >= 1.0:
-            return x, initial_mask_ratio, nfe_cost
-
-        gen_len = x.shape[1] - prompt_len
-
-        # 1. 注入草稿 (Draft Injection)
-        draft_len = kickstart_ids.shape[1]
-        valid_len = min(draft_len, gen_len)
-        # 将草稿填入生成区
-        x[:, prompt_len : prompt_len + valid_len] = kickstart_ids[:, :valid_len]
-        
-        # [NEW] 清洗草稿：确保草稿中的 Pad Token 被重置为 Mask
-        # 这样模型会重新生成这些位置，且它们不会参与 valid draft 的统计
-        if pad_token_id is not None:
-            padding_mask = (x[:, prompt_len:] == pad_token_id)
-            x[:, prompt_len:][padding_mask] = mask_token_id
-
-        # 标记真实草稿位置 (非 Mask 且非 Padding)
-        is_draft = (x[:, prompt_len:] != mask_token_id)
-        if pad_token_id is not None:
-            is_draft = is_draft & (x[:, prompt_len:] != pad_token_id)
-        
-        remask_indices = None
-        
-        # 2. 投影与重掩码 (Projection & Re-masking)
-        if projection_type == 'confidence' or kickstart_strength == -1:
-            # === Confidence Mode ===
-            # 前向传播评估草稿质量
-            outputs = self(x, attention_mask, tok_idx)
-            nfe_cost += 1 # 计数
-            logits = outputs.logits
-            
-            # [CRITICAL] Dream Logit Shift 修正
-            # 必须执行这一步，否则 Logits 和 Token 位置错位
-            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-            
-            gen_logits = logits[:, prompt_len:]
-            probs = torch.softmax(gen_logits, dim=-1)
-            
-            # 获取草稿 Token 的置信度
-            # x 维度 [B, L], unsqueeze 后 [B, L, 1] 用于 gather
-            token_confidences = torch.gather(probs, -1, x[:, prompt_len:].unsqueeze(-1)).squeeze(-1)
-            
-            # 保护非草稿区域（本来就是 Mask）不被选中
-            token_confidences.masked_fill_(~is_draft, 100.0)
-            
-            if kickstart_strength == -1:
-                # 自适应阈值模式
-                remask_indices = (token_confidences < kickstart_threshold) & is_draft
-            else:
-                # 固定比例模式：Mask 掉置信度最低的 N 个
-                num_draft = is_draft.sum(dim=1)
-                k = (num_draft.float() * kickstart_strength).long()
-                
-                remask_indices = torch.zeros_like(is_draft, dtype=torch.bool)
-                for b in range(x.shape[0]):
-                    if k[b] > 0:
-                        # 找出最低置信度的 k 个位置
-                        _, topk_idx = torch.topk(token_confidences[b], k=k[b], largest=False)
-                        remask_indices[b, topk_idx] = True
-                        
-        elif projection_type == 'random':
-            # === Random Mode ===
-            probs = torch.rand_like(x[:, prompt_len:].float())
-            remask_indices = (probs < kickstart_strength) & is_draft
-
-        # 3. 应用重掩码
-        if remask_indices is not None:
-            x[:, prompt_len:][remask_indices] = mask_token_id
-        
-        # 4. 计算剩余 Mask 比例
-        # 用于后续的时间步调度 (Time Travel)
-        current_mask_count = (x[:, prompt_len:] == mask_token_id).sum().item()
-        total_gen_tokens = x.shape[0] * gen_len
-        if total_gen_tokens > 0:
-            initial_mask_ratio = current_mask_count / total_gen_tokens
-        else:
-            initial_mask_ratio = 1.0 # Fallback
-            
-        # 边界保护：防止除零或过小导致步数为0
-        if initial_mask_ratio < 1e-4: 
-            initial_mask_ratio = 1.0 / steps
-
-        return x, initial_mask_ratio, nfe_cost
-    
     @torch.no_grad()
     def diffusion_generate(
         self,
         inputs: Optional[torch.Tensor] = None,
         generation_config: Optional[DreamGenerationConfig] = None,
-        # [NEW] RAG Kick-start 参数
-        kickstart_ids: Optional[torch.Tensor] = None,
-        kickstart_strength: float = 1.0,      # 1.0=不使用草稿(全Mask), 0.0=全信草稿
-        kickstart_threshold: float = 0.9,     # 用于 confidence 模式的筛选阈值
-        projection_type: str = 'confidence',  # 'confidence' 或 'random'
         **kwargs,
     ) -> Union[DreamModelOutput, torch.LongTensor]:
-        # 1. Handle generation_config
+        
+        verifier_model = kwargs.pop("verifier_model", None)
+        
+        # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
         generation_config = self._prepare_generation_config(generation_config, **kwargs)
         generation_tokens_hook_func = kwargs.pop("generation_tokens_hook_func", lambda step, x, logits: x)
         generation_logits_hook_func = kwargs.pop("generation_logits_hook_func", lambda step, x, logits: logits)
@@ -431,7 +385,7 @@ class DreamGenerationMixin:
         attention_mask = kwargs.pop("attention_mask", None)
         self._prepare_special_tokens(generation_config, device=device)
 
-        # 3. Prepare max_length
+        # 3. Prepare `max_length`.
         input_ids_length = input_ids.shape[-1]
         has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
         generation_config = self._prepare_generated_length(
@@ -439,9 +393,10 @@ class DreamGenerationMixin:
             has_default_max_length=has_default_max_length,
             input_ids_length=input_ids_length,
         )
+
         self._validate_generated_length(generation_config, input_ids_length, has_default_max_length)
         
-        # 4. Check device (omitted warnings for brevity, same as original)
+        # 4. Check input_ids
         if not is_torchdynamo_compiling() and self.device.type != input_ids.device.type:
             warnings.warn(
                 "You are calling .generate() with the `input_ids` being on a device type different"
@@ -462,59 +417,48 @@ class DreamGenerationMixin:
                 "generation results, please set `attention_mask` when batch-padding inputs.",
                 UserWarning,
             )
-            
-        # 5. Expand inputs
+
         input_ids, attention_mask = self._expand_inputs_for_generation(
             expand_size=generation_config.num_return_sequences,
             input_ids=input_ids,
             attention_mask=attention_mask 
         )
 
-        # [NEW] 扩展草稿维度以匹配 batch_size
-        if kickstart_ids is not None:
-            kickstart_ids, _ = self._expand_inputs_for_generation(
-                expand_size=generation_config.num_return_sequences,
-                input_ids=kickstart_ids
+        if generation_config.alg == "apd" or generation_config.alg == "leftright":
+            result = self.apd_sample(
+                input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                generation_tokens_hook_func=generation_tokens_hook_func,
+                generation_logits_hook_func=generation_logits_hook_func,
+                verifier_model=verifier_model
+                
             )
-
-        threshold = kwargs.get("threshold", 0.9)
-
-        # 6. Call sample
-        result = self._sample(
-            input_ids,
-            attention_mask=attention_mask,
-            generation_config=generation_config,
-            generation_tokens_hook_func=generation_tokens_hook_func,
-            generation_logits_hook_func=generation_logits_hook_func,
-            threshold=threshold,
-            # [NEW] 传递 Kick-start 参数
-            kickstart_ids=kickstart_ids,
-            kickstart_strength=kickstart_strength,
-            kickstart_threshold=kickstart_threshold,
-            projection_type=projection_type
-        )
+        else:
+            result = self._sample(
+                input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                generation_tokens_hook_func=generation_tokens_hook_func,
+                generation_logits_hook_func=generation_logits_hook_func
+            )
+        
+        
         return result
-    
+
     def _sample(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor],
         generation_config: DreamGenerationConfig,
         generation_tokens_hook_func,
-        generation_logits_hook_func,
-        threshold: Optional[float] = 0.9,
-        # [NEW] 接收 Kick-start 参数
-        kickstart_ids: Optional[torch.Tensor] = None,
-        kickstart_strength: float = 1.0,
-        kickstart_threshold: float = 0.9,
-        projection_type: str = 'confidence',
+        generation_logits_hook_func
     ) -> Union[DreamModelOutput, torch.LongTensor]:
         # init values
         output_history = generation_config.output_history
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
         mask_token_id = generation_config.mask_token_id
-        pad_token_id = generation_config.pad_token_id
         steps = generation_config.steps
         eps = generation_config.eps
         alg = generation_config.alg
@@ -524,23 +468,17 @@ class DreamGenerationMixin:
         top_k = generation_config.top_k
 
         histories = [] if (return_dict_in_generate and output_history) else None
-        start_time = time.time()
-        nfe = 0 # Initialize NFE counter
-        
-        # [MODIFIED] 画布初始化逻辑
-        prompt_len = input_ids.shape[1]
-        gen_len = max_length - prompt_len
-        
-        # 先创建一个全 Mask 的画布
-        x = F.pad(input_ids, (0, gen_len), value=mask_token_id)
-        
-        # [MODIFIED] Attention Mask 处理前置
-        # 因为 initialize_with_kickstart 可能需要进行 forward 计算置信度，
-        # 所以必须先构建好 attention_mask 和 tok_idx
+
+        # pad input_ids to max_length
+        x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+
         if attention_mask is not None and torch.any(attention_mask == 0.0):
+            # we do not mask the [MASK] tokens so value = 1.0
             attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
             tok_idx = attention_mask.long().cumsum(-1) - 1
             tok_idx.masked_fill_(attention_mask == 0, 1)
+            # attention_mask is of shape [B, N]
+            # broadcast to [B, 1, N, N]
             attention_mask = torch.logical_and(
                 attention_mask.unsqueeze(1).unsqueeze(-2),
                 attention_mask.unsqueeze(1).unsqueeze(-1),
@@ -548,108 +486,30 @@ class DreamGenerationMixin:
         else:
             tok_idx = None
             attention_mask = "full"
-
-        # [NEW] 调用 Kick-start 初始化
-        x, initial_mask_ratio, init_nfe = self.initialize_with_kickstart(
-            x=x,
-            prompt_len=prompt_len,
-            kickstart_ids=kickstart_ids,
-            kickstart_strength=kickstart_strength,
-            kickstart_threshold=kickstart_threshold,
-            projection_type=projection_type,
-            mask_token_id=mask_token_id,
-            pad_token_id=pad_token_id, # Pass pad token
-            attention_mask=attention_mask,
-            tok_idx=tok_idx,
-            steps=steps
-        )
-        nfe += init_nfe
-
-        # [MODIFIED] 自适应调度 (Adaptive Scheduling)
-        # 根据 Mask 比例动态计算 effective_steps，实现加速
-        effective_steps = int(steps * initial_mask_ratio)
-        if effective_steps < 1: effective_steps = 1
         
-        # 时间步重映射：从 initial_mask_ratio 开始，而不是从 1.0 开始
-        timesteps = torch.linspace(initial_mask_ratio, eps, effective_steps + 1, device=x.device)
+        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
 
-        # hook
+        # this allows user-defined token control of the intermediate steps
         x = generation_tokens_hook_func(None, x, None)
-        
-        # 针对 confidence_threshold 算法的变量准备
-        if alg == 'confidence_threshold':
+        for i in range(steps):
             mask_index = (x == mask_token_id)
-            total_mask_num = mask_index.sum().item()
-            
-            # [MODIFIED] 适配 effective_steps
-            if effective_steps > 0:
-                number_transfer_tokens = total_mask_num // effective_steps
-            else:
-                number_transfer_tokens = total_mask_num
-            left_tokens_last_step = 0
-            
-        
-        i = 0
-        # [MODIFIED] 循环次数改为 effective_steps
-        while i < effective_steps:
-            mask_index = (x == mask_token_id)
-            # 提前退出检查
-            if not mask_index.any():
-                break
-                
             logits = self(x, attention_mask, tok_idx).logits
-            nfe += 1 # Count NFE
-            
-            # [CRITICAL] Dream Logit Shift
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
 
+            # this allows user-defined logits control of the intermediate steps
             logits = generation_logits_hook_func(i, x, logits)
+
             mask_logits = logits[mask_index]
-            
-            if not alg == 'confidence_threshold':
-                t = timesteps[i]
-                s = timesteps[i + 1]
-            
-            # === 算法分支 ===
+            t = timesteps[i]
+            s = timesteps[i + 1]
+        
             if alg == 'origin':
-                p_transfer = 1 - s / t if i < effective_steps - 1 else 1
+                p_transfer = 1 - s / t if i < steps - 1 else 1
                 x0 = torch.zeros_like(x[mask_index], device=self.device, dtype=torch.long) + mask_token_id
                 transfer_index_t_s = torch.rand(*x0.shape, device=self.device) < p_transfer
                 _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
                 x[mask_index] = x0.clone()
-            
-            elif alg == 'confidence_threshold':
-                confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-                x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
-                x_[mask_index] = x0.clone()
-                full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
-                full_confidence[mask_index] = confidence
-                
-                current_transfer_tokens = number_transfer_tokens + left_tokens_last_step
-                left_tokens_last_step = 0
-                
-                valid_mask_count = mask_index.sum().item()
-                if current_transfer_tokens > valid_mask_count:
-                    current_transfer_tokens = valid_mask_count
-                
-                selected_confidence, select_index = torch.topk(full_confidence, current_transfer_tokens)
-                transfer_index = torch.zeros_like(x, device=x.device, dtype=torch.bool)
-                select_index = select_index.to(x.device)
-                
-                transfer_index[0, select_index[0]] = True
-                
-                for k in range(current_transfer_tokens): 
-                     if selected_confidence[0, k] < threshold:
-                        if i < effective_steps - 1:
-                            left_tokens_last_step += 1
-                            transfer_index[0, select_index[0, k]] = False
-                        else:
-                            pass 
-
-                x[transfer_index] = x_[transfer_index].clone()
-
             else:
-                # maskgit_plus, topk_margin, entropy
                 if alg == 'maskgit_plus':
                     confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
                 elif alg == 'topk_margin':
@@ -658,35 +518,225 @@ class DreamGenerationMixin:
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                 else:
                     raise RuntimeError(f"Unknown alg: {alg}")
-                
-                num_mask_token = mask_index.sum() / mask_index.shape[0]
-                number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < effective_steps - 1 else int(num_mask_token)
-                
-                full_confidence = torch.full_like(x, -torch.inf, device=self.device, dtype=logits.dtype)
-                full_confidence[mask_index] = confidence
+                num_mask_token = mask_index.sum()
+                number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else num_mask_token
                 if number_transfer_tokens > 0:
                     if alg_temp is None or alg_temp == 0:
-                        _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+                        _, transfer_index = torch.topk(confidence, number_transfer_tokens)
                     else:
-                        full_confidence = full_confidence / alg_temp
-                        full_confidence = F.softmax(full_confidence, dim=-1)
-                        transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
-                    x_ = torch.zeros_like(x, device=self.device, dtype=torch.long) + mask_token_id
-                    x_[mask_index] = x0.clone()
-                    row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
-                    x[row_indices,transfer_index] = x_[row_indices,transfer_index]
+                        confidence = confidence / alg_temp
+                        confidence = F.softmax(confidence, dim=-1)
+                        transfer_index = torch.multinomial(confidence, num_samples=number_transfer_tokens)
+                    x0_ = torch.zeros_like(x0, device=self.device, dtype=torch.long) + mask_token_id
+                    x0_[transfer_index] = x0[transfer_index].clone()
+                    x[mask_index] = x0_
 
+            # this allows user-defined token control of the intermediate steps
             x = generation_tokens_hook_func(i, x, logits)
 
             if histories is not None:
                 histories.append(x.clone())
-            i += 1
-        
-        print(f'used steps: {effective_steps} (Original plan: {steps})')
-        end_time = time.time()
-        print(f'used time: {end_time - start_time}')
         
         if return_dict_in_generate:
-            return DreamModelOutput(sequences=x, history=histories, nfe=nfe)
+            return DreamModelOutput(
+                sequences=x,
+                history=histories,
+            )
         else:
             return x
+        
+    def apd_sample(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        generation_config: DreamGenerationConfig,
+        generation_tokens_hook_func,
+        generation_logits_hook_func,
+        verifier_model
+    ) -> Union[DreamModelOutput, torch.LongTensor]:
+        
+        total_time =  time.time()
+        num_forward_evals = 0
+        num_tokens_generated = 0
+        total_verification_time = 0
+        acceptance_counts = []
+        
+        
+        # init values
+        output_history = generation_config.output_history
+        return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
+        mask_token_id = generation_config.mask_token_id
+        temperature = generation_config.temperature
+        top_p = generation_config.top_p
+        top_k = generation_config.top_k
+        tokens_per_step = generation_config.tokens_per_step
+        kv_window = generation_config.kv_window
+        max_lookahead = generation_config.max_lookahead
+        apd_mixture_weight = generation_config.apd_mixture_weight
+
+        # pad input_ids to max_length
+        x = F.pad(input_ids, (0, max_length - input_ids.shape[1]), value=mask_token_id)
+        
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            # we do not mask the [MASK] tokens so value = 1.0
+            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            # attention_mask is of shape [B, N]
+            # broadcast to [B, 1, N, N]
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
+        else:
+            tok_idx = None
+            attention_mask = "full"
+
+
+        # this allows user-defined token control of the intermediate steps
+        generation_tokens_hook_func(None, x, None)
+        
+        indices = (x == mask_token_id).nonzero()
+        masked_indices, _ = torch.unique(indices[:, 1], return_inverse=True)
+        curr_idx = masked_indices[0].item()
+        is_prefilling = True
+        verifier_past_key_values = None
+        
+        prev_logits = None
+        all_cache_positions = torch.arange(x.shape[-1]).long().to(self.device)
+        diffusion_past_key_values = None
+        
+        while curr_idx < x.shape[-1]:
+            
+            if max_lookahead is not None:
+                right_idx = min(curr_idx + max_lookahead, x.shape[-1])
+            else:
+                right_idx = x.shape[-1]
+                
+            if kv_window is not None: #and diffusion_past_key_values is not None:
+                if diffusion_past_key_values is None:
+                    left_idx = 0
+                else:
+                    left_idx = max(curr_idx - kv_window - num_accept + 1, 0) # Subtract num_accept to compute KV on newly sampled tokens
+            else:
+                left_idx = 0
+            
+            truncated_x = x[:, left_idx:right_idx]
+            mask_index = (truncated_x == mask_token_id)
+
+            
+            cache_position = all_cache_positions[left_idx:right_idx] if diffusion_past_key_values is not None else None
+            position_ids = cache_position.unsqueeze(0) if cache_position is not None else None
+            
+            if diffusion_past_key_values is not None:
+                diffusion_past_key_values.crop(left_idx)
+            
+            outputs = self(truncated_x, 
+                            attention_mask="full", 
+                            past_key_values=diffusion_past_key_values,
+                            cache_position=cache_position,
+                            position_ids=position_ids)
+            
+            logits = outputs.logits
+            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+            
+            diffusion_past_key_values = outputs.past_key_values if kv_window is not None else None
+            
+            num_forward_evals += 1
+
+            # this allows user-defined logits control of the intermediate steps
+            generation_logits_hook_func(curr_idx, x, None)
+            mask_logits = logits[mask_index]
+            
+            gumbel_noise, x0 = sample_with_gumbel(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+            
+            diffusion_logits = mask_logits[:, :151936].unsqueeze(0) #Restrict to vocab of qwen
+            
+            # Verification begins
+            verification_time = time.time()
+            
+            if apd_mixture_weight is not None:
+                if is_prefilling:
+                    
+                    draft = x.clone()[:, :right_idx]
+                    draft[:, curr_idx:right_idx] = x0
+                    cache_position = None
+                    attention_mask = None
+                    position_ids = None
+                else:
+                    draft = x0.clone().unsqueeze(0)
+                    cache_position = all_cache_positions[curr_idx:right_idx]
+                    position_ids = cache_position.unsqueeze(0)
+                    
+                
+                verifier_outputs = verifier_model(draft, 
+                                                  past_key_values=verifier_past_key_values,
+                                                  cache_position=cache_position,
+                                                  position_ids=position_ids) 
+                
+                verifier_past_key_values = verifier_outputs.past_key_values
+                
+                 
+                if is_prefilling:
+                    verifier_logits = verifier_outputs.logits[:, curr_idx-1:-1, :] #shift logits
+                else:
+                    verifier_logits = verifier_outputs.logits
+                    verifier_logits = torch.cat([prev_logits, verifier_logits[:, :-1, :]], dim=1)
+                
+                if max_lookahead is not None:    
+                    verifier_logits = verifier_logits[:, :max_lookahead, :]  
+                is_prefilling = False
+
+                accept = apd_accept_criterion(draft, diffusion_logits, verifier_logits, gumbel_noise, apd_mixture_weight)
+                
+
+                num_accept = accept.sum().item()
+                num_accept = min(num_accept, x0.shape[-1])
+
+                
+                if num_accept < verifier_logits.shape[1]:
+                    prev_logits = verifier_logits[:, num_accept, :].unsqueeze(1)
+                else:
+                    prev_logits = verifier_logits[:, -1, :].unsqueeze(1)
+                    
+                verifier_past_key_values.crop(curr_idx+num_accept)
+            else:
+                num_accept = tokens_per_step
+            
+            x[0, curr_idx:curr_idx+num_accept] = x0[:num_accept]
+            curr_idx += num_accept
+
+            no_mask = (x == mask_token_id).sum().item() == 0
+            has_eos = (x == generation_config.eos_token_id).sum().item() > 0
+            
+            
+            # this allows user-defined token control of the intermediate steps
+            total_verification_time += time.time() - verification_time
+            num_tokens_generated += num_accept
+            
+            acceptance_counts.append(num_accept)
+            generation_tokens_hook_func(curr_idx, x, acceptance_counts)
+            
+            if no_mask or has_eos:
+                break
+            
+        total_time = time.time() - total_time
+        
+        profile = ProfileOutput(
+            num_forward_evals=num_forward_evals,
+            num_tokens_generated=num_tokens_generated,
+            verification_time=total_verification_time,
+            total_time=total_time,
+            acceptance_counts=acceptance_counts,
+        )
+        
+        if return_dict_in_generate:
+            return DreamModelOutputWithProfile(
+                sequences=x,
+                profile=profile
+            )
+        else:
+            return x
+        
+        

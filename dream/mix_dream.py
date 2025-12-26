@@ -63,6 +63,7 @@ def main():
     parser.add_argument('--save_result', action='store_true', help='保存详细结果')
     parser.add_argument('--verbose', action='store_true', help='打印详细日志')
     parser.add_argument('--data_ratio', type=float, default=1.0, help='如0.1表示只用10%数据')
+    parser.add_argument('--dynamic_gen_length', action='store_true', help='根据草稿长度动态调整 gen_length')
 
     # --- 生成参数 (Dream & Fast-dLLM) ---
     parser.add_argument('--gen_length', type=int, default=128, help='生成长度')
@@ -163,7 +164,8 @@ def main():
         # 注意: 0.0 在 mix.py 逻辑中通常指直接输出草稿，但在 Dream 代码中 kickstart_strength=0.0 意味着全信草稿
         # 为了与 Dream 逻辑一致: 0.0 (全信草稿), 1.0 (全重绘/不使用草稿)
         # 这里的 steps 用于生成比例列表
-        base_steps = [0, 32, 64, 96, 128] # 示例步数点
+        base_steps = [-128,0,2,4,8,16,32,64,96,128] # 示例步数点
+        # base_steps = [0, 32, 64, 96, 128] # 示例步数点
         strengths_to_test = [float(s/128) for s in base_steps]
         strengths_to_test.insert(0, -1) # 添加自适应模式
         # 确保 1.0 在列表最后作为 Baseline
@@ -268,6 +270,18 @@ def main():
                     pad_tensor = torch.full((current_bs, args.option_padding), MASK_ID, device=device, dtype=torch.long)
                     kickstart_ids = torch.cat([pad_tensor, kickstart_ids], dim=1)
 
+                # [新增] 动态计算生成长度
+                if args.dynamic_gen_length:
+                    # 逻辑参考 mix.py: 根据草稿长度对齐 block_length
+                    current_block_len = max(1, args.block_length)
+                    draft_len = kickstart_ids.shape[1]
+                    calc_len = (draft_len // current_block_len + 1) * current_block_len
+                    # 限制范围，防止过短或过长
+                    real_gen_length = max(64, min(calc_len, 256))
+                else:
+                    real_gen_length = args.gen_length
+                print(f"本次生成长度: {real_gen_length}")
+                
                 # 2. 执行生成
                 torch.cuda.synchronize()
                 t_gen_start = time.perf_counter()
@@ -276,7 +290,7 @@ def main():
                 output = model.diffusion_generate(
                     inputs['input_ids'],
                     attention_mask=inputs['attention_mask'],
-                    max_new_tokens=args.gen_length,
+                    max_new_tokens=real_gen_length, # [修改] 使用 real_gen_length
                     return_dict_in_generate=True,
                     # 基础参数
                     steps=args.steps,
@@ -319,58 +333,75 @@ def main():
                 if args.verbose and batch_idx == 0:
                     print(f"      [Str={strength}, Rank={rank}] NFE={nfe}, Time={t_cost:.2f}s")
 
-    # 7. 评估与输出表格
-    print("\n" + "=" * 80)
-    print(f"{'EVALUATION RESULTS':^80}")
-    print("=" * 80)
-    
+   # 7. 评估与输出表格
+    print("\n" + "=" * 90)
+    print(f"{'全维度评估结果 (Strength x Rank)':^90}")
+    print("=" * 90)
+
     metric_objs = load_evaluation_metrics(args.dataset)
-    
-    # 打印表头
-    headers = ["Strength", "Rank", "Time(s)", "Avg NFE"] 
-    # 动态获取 Metric 名字 (跑一次空的 compute_metrics 获取 key)
-    # 这里直接假设 compute_metrics 返回字典
-    sample_metrics = compute_metrics([""], [""], args.dataset, metric_objs)
-    metric_keys = list(sample_metrics.keys())
-    headers.extend(metric_keys)
-    
-    row_format = "{:<10} {:<6} {:<10} {:<10}" + " {:<12}" * len(metric_keys)
-    print(row_format.format(*headers))
-    print("-" * 80)
+    final_results = {}
+    all_metric_keys = set()
 
-    # 排序输出: 优先按 Rank, 然后按 Strength (从自适应到1.0)
-    sorted_keys = sorted(stats_storage.keys(), key=lambda x: (x[1], x[0]))
-    
+    for key, stats in stats_storage.items():
+        s, r = key
+        if NUM_TEST_EXAMPLES > 0:
+            print(f"正在评估: Strength {s*100 if s!=-1 else -1:.0f}% - Rank {r} ...")
+            metrics = compute_metrics(stats['predictions'], stats['references'], args.dataset, metric_objs)
+            row = {
+                'Time(s)': stats['total_time'] / NUM_TEST_EXAMPLES,
+                'Steps': stats['total_nfe'] / NUM_TEST_EXAMPLES if NUM_TEST_EXAMPLES > 0 else 0
+            }
+            row.update(metrics)
+            final_results[key] = row
+            all_metric_keys.update(metrics.keys())
+
+            # 保存到文件
+            if args.save_result:
+                os.makedirs("results_dream", exist_ok=True)
+                fname = f"results_dream/{args.dataset}_str{int(s*100 if s!=-1 else -1)}_rank{r}.txt"
+                with open(fname, 'w', encoding='utf-8') as f:
+                    for p in stats['predictions']:
+                        f.write(p.replace('\n', ' ') + '\n')
+
+    # --- 打印超级表格 ---
+    sorted_keys = sorted(final_results.keys(), key=lambda x: (-x[0], x[1]))
+    metric_headers = sorted(list(all_metric_keys))
+    headers = ['Strength', 'Rank', 'Time(s)', 'Steps'] + metric_headers
+    col_w = 12
+
+    def print_row(vals, is_header=False):
+        row_s = "│ " + " │ ".join([f"{str(v):^{col_w}}" for v in vals]) + " │"
+        print(row_s)
+        if is_header:
+            print("├" + "┼".join(["─" * (col_w + 2) for _ in vals]) + "┤")
+
+    print("\n┌" + "┬".join(["─" * (col_w + 2) for _ in headers]) + "┐")
+    print_row(headers, is_header=True)
+
+    curr_str = -1
     for s, r in sorted_keys:
-        data = stats_storage[(s, r)]
-        preds = data['predictions']
-        refs = data['references']
-        
-        # 计算指标
-        scores = compute_metrics(preds, refs, args.dataset, metric_objs)
-        
-        # 准备行数据
-        avg_time = data['total_time'] / NUM_TEST_EXAMPLES
-        avg_nfe = data['total_nfe'] / NUM_TEST_EXAMPLES if NUM_TEST_EXAMPLES > 0 else 0
-        
-        str_val = "Adaptive" if s == -1 else f"{s:.2f}"
-        row_vals = [str_val, r, f"{avg_time:.3f}", f"{avg_nfe:.1f}"]
-        for k in metric_keys:
-            row_vals.append(f"{scores.get(k, 0):.4f}")
-            
-        print(row_format.format(*row_vals))
-        
-        # 保存到文件
-        if args.save_result:
-            os.makedirs("results_dream", exist_ok=True)
-            fname = f"results_dream/{args.dataset}_str{s}_rank{r}.txt"
-            with open(fname, 'w', encoding='utf-8') as f:
-                for p in preds:
-                    f.write(p.replace('\n', ' ') + '\n')
+        if s != curr_str and curr_str != -1:
+            pass
+        curr_str = s
 
-    print("-" * 80)
-    print(f"RAG Total Search Time: {rag_search_time:.2f}s")
-    print("Done.")
+        data = final_results[(s, r)]
+        cells = [f"{s*100:.0f}%", f"Top-{r+1}"]
+        cells.append(f"{data.get('Time(s)',0):.3f}")
+        cells.append(f"{data.get('Steps',0):.1f}")
+
+        for mh in metric_headers:
+            val = data.get(mh, 0)
+            cells.append(f"{val:.4f}" if isinstance(val, float) else str(val))
+
+        print_row(cells)
+
+    print("└" + "┴".join(["─" * (col_w + 2) for _ in headers]) + "┘")
+
+    # RAG 统计
+    if NUM_TEST_EXAMPLES > 0:
+        print(f"\n\033[1;35m[RAG] 检索总耗时: {rag_search_time:.2f} 秒，平均每样本: {rag_search_time / NUM_TEST_EXAMPLES:.4f} 秒\033[0m")
+
+    print("\n实验结束。")
 
 if __name__ == "__main__":
     main()

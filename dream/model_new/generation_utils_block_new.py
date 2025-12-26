@@ -116,7 +116,7 @@ def sample_tokens(logits, temperature=0.0, top_p=None, top_k=None, margin_confid
 class DreamModelOutput(ModelOutput):
     sequences: torch.LongTensor = None
     history: Optional[Tuple[torch.FloatTensor]] = None
-    nfe: Optional[int] = None  # ✅ 改为 Optional 并设默认值为 None
+    nfe: Optional[int] = None 
 
 
 class DreamGenerationConfig(GenerationConfig):
@@ -184,7 +184,6 @@ class DreamGenerationMixin:
             attention_mask = attention_mask.repeat_interleave(expand_size, dim=0)
         return input_ids, attention_mask
 
-    # ... (省略 _validate_generated_length, _prepare_generated_length, _prepare_generation_config, _prepare_special_tokens，这些保持不变) ...
     def _validate_generated_length(self, generation_config, input_ids_length, has_default_max_length):
         if is_torchdynamo_compiling():
             return
@@ -245,19 +244,18 @@ class DreamGenerationMixin:
         kickstart_threshold: float,
         projection_type: str,
         mask_token_id: int,
+        pad_token_id: Optional[int], # NEW argument
         attention_mask: Optional[torch.Tensor],
         tok_idx: Optional[torch.Tensor],
         steps: int # 这里主要用于计算 fallback ratio
-    ) -> Tuple[torch.LongTensor, float]:
+    ) -> Tuple[torch.LongTensor, int]: # Returns x and nfe_cost
         """
         RAG Kick-start 初始化：注入草稿并执行全局重掩码。
         在 Blockwise 模式下，我们仍然先进行全局初始化，然后在 Block 循环中处理局部 mask。
         """
-        # 默认初始状态：全 Mask (Block内会处理)
-        # 注意：initial_mask_ratio 在这里计算的是全局的，但在 blockwise 中我们会重新计算局部的
-        
+        nfe_cost = 0
         if kickstart_ids is None or kickstart_strength >= 1.0:
-            return x
+            return x, nfe_cost
 
         gen_len = x.shape[1] - prompt_len
 
@@ -266,16 +264,22 @@ class DreamGenerationMixin:
         valid_len = min(draft_len, gen_len)
         x[:, prompt_len : prompt_len + valid_len] = kickstart_ids[:, :valid_len]
         
+        # [NEW] Mask Padding in Draft
+        if pad_token_id is not None:
+            padding_mask = (x[:, prompt_len:] == pad_token_id)
+            x[:, prompt_len:][padding_mask] = mask_token_id
+            
         is_draft = (x[:, prompt_len:] != mask_token_id)
-        
+        if pad_token_id is not None:
+            is_draft = is_draft & (x[:, prompt_len:] != pad_token_id)
+
         remask_indices = None
         
         # 2. 投影与重掩码
         if projection_type == 'confidence' or kickstart_strength == -1:
             # 前向传播评估草稿质量
-            # 注意：对于超长序列，全量 Forward 可能 OOM。但通常 Draft 长度在可控范围内。
-            # 如果必须考虑显存，这里应该分块计算 Confidence，但为了代码逻辑连贯，暂时保持全量。
             outputs = self(x, attention_mask, tok_idx)
+            nfe_cost += 1 # Count NFE
             logits = outputs.logits
             # Logit Shift
             logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
@@ -304,7 +308,7 @@ class DreamGenerationMixin:
         if remask_indices is not None:
             x[:, prompt_len:][remask_indices] = mask_token_id
             
-        return x
+        return x, nfe_cost
 
     @torch.no_grad()
     def diffusion_generate(
@@ -388,6 +392,7 @@ class DreamGenerationMixin:
         return_dict_in_generate = generation_config.return_dict_in_generate
         max_length = generation_config.max_length
         mask_token_id = generation_config.mask_token_id
+        pad_token_id = generation_config.pad_token_id # Get pad token
         steps = generation_config.steps
         temperature = generation_config.temperature
         top_p = generation_config.top_p
@@ -419,7 +424,7 @@ class DreamGenerationMixin:
 
         # 3. [NEW] Kick-start Global Initialization
         # 这会填充 x 并根据置信度 mask 掉不确定的部分
-        x = self.initialize_with_kickstart(
+        x, init_nfe = self.initialize_with_kickstart(
             x=x,
             prompt_len=prompt_len,
             kickstart_ids=kickstart_ids,
@@ -427,10 +432,12 @@ class DreamGenerationMixin:
             kickstart_threshold=kickstart_threshold,
             projection_type=projection_type,
             mask_token_id=mask_token_id,
+            pad_token_id=pad_token_id,
             attention_mask=attention_mask,
             tok_idx=tok_idx,
             steps=steps
         )
+        nfe += init_nfe # ADD nfe count
 
         # Handle block configuration
         if block_length is None:
