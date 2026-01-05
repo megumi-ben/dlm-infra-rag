@@ -18,7 +18,7 @@ NUM_EXAMPLES=3
 # 批量数据集列表
 DATASETS=(
     # "mmlu"
-    "arc"
+    # "arc"
     # "gpqa"
     # "hellaswag"
     # "piqa"
@@ -33,7 +33,7 @@ DATASETS=(
     # "webquestions"
     # "ms_marco"
 
-    # "alpaca"
+    "alpaca"
     # "dolly"
     
     
@@ -48,7 +48,7 @@ DATASETS=(
     
     # "qqp"
     # "banking77"
-    # "bitext_customer"
+    "bitext_customer"
 
     # "openorca"
     # "wmt14"
@@ -74,6 +74,7 @@ for DATASET in "${DATASETS[@]}"; do
     echo "==> 正在运行: Dataset = ${DATASET}, Temperature = ${TEMP} (N=${NUM_EXAMPLES} 样本)..."
     LOG_FILE="${LOG_DIR}/${DATASET}_temp${TEMP}_n${NUM_EXAMPLES}.log"
     python -u $PYTHON_SCRIPT \
+        --model_path /backup01/DLM/model/Llama-3.1-8B-Instruct \
         --temperature $TEMP \
         --num_test_examples $NUM_EXAMPLES \
         --dataset $DATASET \
@@ -83,17 +84,20 @@ for DATASET in "${DATASETS[@]}"; do
         --embed_model /backup01/DLM/model/bge-small-en-v1.5 \
         --rerank_model /backup01/DLM/model/bge-reranker-v2-m3 \
         --test_top_k 3 \
+        --batch_size -1 \
         --compare_mode rank_specific \
         --gpu_memory_utilization 0.6 \
-        --max_tokens 128 \
+        --max_tokens 512 \
         --top_p 0.9 \
-        # > $LOG_FILE 2>&1 
-        # --dynamic_gen_length \
-        # --generation_mode dual_cache \
-        # --threshold 0.9 \
-        # --allow_draft_transfer \
-        # --option_padding 2 \
-      # --save_result
+        # > $LOG_FILE 2>&1
+        # --use_flashinfer \
+        # --draft_model_path /backup01/DLM/model/EAGLE-LLaMA3.1-Instruct-8B \
+        # --num_speculative_tokens 5 \
+        # --quantization awq \
+        # --model_path /backup01/DLM/model/Qwen2.5-7B-Instruct \
+        # --model_path /backup01/DLM/model/Llama-3.1-8B-Instruct \
+        # --model_path /backup01/DLM/model/Meta-Llama-3.1-8B-Instruct-AWQ-INT4 \
+        # --model_path /backup01/DLM/model/Qwen2.5-7B-Instruct-AWQ \
     echo "==> 完成. 日志已保存到: ${LOG_FILE}"
 done
 

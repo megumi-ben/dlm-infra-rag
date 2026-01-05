@@ -38,6 +38,3 @@ dtype="auto",      # 必须设为 auto
 # MODEL_PATH = "/backup01/DLM/model/Qwen2.5-7B-Instruct-AWQ"
 ```
 
-## 要求
-
-现在mix_ar.py中只有简单的vllm框架下面的大模型加上我的rag检索草稿热启动技术，没有融合 parallel_vllm_chat.py 中的falshinfer、eagle投机解码、awq权重量化，请帮我完成完整的mix_ar.py.

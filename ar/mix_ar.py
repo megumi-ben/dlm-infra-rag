@@ -5,7 +5,7 @@ import torch
 import gc
 from typing import List, Dict
 
-# 引入项目模块
+# 引入项目模块 (保持原有引用)
 from rag_engine import AdvancedRAGEngine
 from dataset_processor import (
     process_prompt, 
@@ -13,13 +13,6 @@ from dataset_processor import (
     load_evaluation_metrics
 )
 from evaluation import compute_metrics
-
-# 尝试引入 vLLM
-try:
-    from vllm import LLM, SamplingParams
-except ImportError:
-    print("Error: vLLM library is not installed. Please install it to run this AR baseline.")
-    exit(1)
 
 def construct_rag_prompt(original_prompt: str, retrieved_context: str) -> str:
     """
@@ -37,10 +30,10 @@ def construct_rag_prompt(original_prompt: str, retrieved_context: str) -> str:
     # 
     # <Current Processed Prompt>
     
-    return f"References:\n{retrieved_context}\n\n{original_prompt}"
+    return f"Examaples:\n{retrieved_context}\nReal Questions:\n{original_prompt}"
 
 def main():
-    parser = argparse.ArgumentParser(description="运行 AR Baseline (vLLM + RAG) 对比实验")
+    parser = argparse.ArgumentParser(description="运行 AR Baseline (vLLM + RAG) 对比实验 - Enhanced Version")
     
     # --- 基础配置 ---
     parser.add_argument('--model_path', type=str, default='/backup01/DLM/model/Qwen2.5-7B-Instruct', help='AR模型路径')
@@ -55,6 +48,7 @@ def main():
     parser.add_argument('--test_top_k', type=int, default=1, help='检索 Top-K 深度')
     parser.add_argument('--data_ratio', type=float, default=1.0, help='数据使用比例')
     parser.add_argument('--max_size', type=int, default=None, help='数据最大条数')
+    parser.add_argument('--batch_size', type=int, default=-1, help='批量大小')
     parser.add_argument('--rag_engine', type=str, default='ours', help='RAG引擎类型 (ours/flashrag)')
 
     # --- 生成配置 (vLLM) ---
@@ -63,6 +57,12 @@ def main():
     parser.add_argument('--max_tokens', type=int, default=512, help='最大生成长度')
     parser.add_argument('--gpu_memory_utilization', type=float, default=0.9, help='vLLM 显存占用比例')
     
+    # --- 高级特性配置 (新增) ---
+    parser.add_argument('--use_flashinfer', action='store_true', help='是否启用 FlashInfer 后端')
+    parser.add_argument('--quantization', type=str, default=None, help='量化方法, e.g., "awq"')
+    parser.add_argument('--draft_model_path', type=str, default=None, help='投机解码(EAGLE) Draft Model 路径')
+    parser.add_argument('--num_speculative_tokens', type=int, default=5, help='投机解码步数')
+
     # --- 实验模式 ---
     parser.add_argument('--compare_mode', type=str, default='rank_specific', 
                         choices=['rank_specific', 'concat'],
@@ -70,12 +70,32 @@ def main():
 
     args = parser.parse_args()
 
+    # ========================================================================
+    # 0. 环境配置 (必须在 import vllm 之前设置)
+    # ========================================================================
+    if args.use_flashinfer:
+        print(">>> 启用 FlashInfer 后端...")
+        os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
+    
+    # 延迟引入 vLLM，确保环境变量生效
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError:
+        print("Error: vLLM library is not installed. Please install it to run this AR baseline.")
+        exit(1)
+
     print(f"\n" + "=" * 80)
-    print(f"{'MAIN_AR.PY - AR Baseline (vLLM + RAG)':^80}")
+    print(f"{'MAIN_AR.PY - AR Baseline (vLLM + RAG + Features)':^80}")
     print("=" * 80)
     print(f"模型: {args.model_path}")
+    if args.draft_model_path:
+        print(f"投机解码 (EAGLE): {args.draft_model_path}")
+    if args.quantization:
+        print(f"量化模式: {args.quantization}")
+    if args.use_flashinfer:
+        print(f"加速后端: FlashInfer")
     print(f"数据集: {args.dataset} | 样本数: {args.num_test_examples}")
-    print(f"RAG模式: {args.compare_mode} | Top-K: {args.test_top_k}")
     print("=" * 80 + "\n")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -120,8 +140,7 @@ def main():
         print(f"正在为 {len(eval_prompts)} 条测试数据检索 Top-{args.test_top_k}...")
         start_search = time.perf_counter()
         
-        # retrieval_results 是一个 List[List[Dict]], 
-        # Dict 包含 {'prompt': str, 'target': str, 'score': float, ...}
+        # retrieval_results 是一个 List[List[Dict]]
         retrieval_results, _ = rag.batch_search(
             eval_prompts,
             top_k_retrieve=args.test_top_k * 2,
@@ -131,20 +150,13 @@ def main():
         elapsed_search = time.perf_counter() - start_search
         print(f"检索完成，耗时: {elapsed_search:.2f}s")
         
-        # --- [关键修改] 处理检索结果 ---
+        # 处理检索结果
         for res_list in retrieval_results:
             processed_list = []
             for res in res_list:
-                # 1. 获取检索出来的原始 prompt 和 target
                 r_prompt = res['prompt'].strip()
                 r_target = res['target'].strip()
-                
-                # 2. 直接拼接，不使用 process_retrieved_kickstart_text
-                # 格式:
-                # Question: ...
-                # Answer: ... (或者直接拼接，视具体数据集内容而定，这里用换行分隔)
-                combined_text = f"{r_prompt}\n{r_target}"
-                
+                combined_text = f"{r_prompt}\nThe correct answer: {r_target}"
                 processed_list.append(combined_text)
             retrieval_cache.append(processed_list)
             
@@ -161,17 +173,35 @@ def main():
         exit(1)
 
     # ========================================================================
-    # 3. 加载 vLLM 模型
+    # 3. 加载 vLLM 模型 (含 EAGLE, AWQ, FlashInfer配置)
     # ========================================================================
     print("\n>>> [Phase 2] 加载 AR 模型 (vLLM)...")
     try:
+        # 配置投机解码 (EAGLE)
+        speculative_config = None
+        if args.draft_model_path:
+            speculative_config = {
+                "method": "eagle",
+                "model": args.draft_model_path,
+                "num_speculative_tokens": args.num_speculative_tokens,
+            }
+
+        # 确定 dtype
+        # 如果使用 AWQ 量化，通常建议 dtype="auto"
+        # 否则默认使用 bfloat16
+        dtype_setting = "bfloat16"
+        if args.quantization and "awq" in args.quantization.lower():
+            dtype_setting = "auto"
+        
         llm = LLM(
             model=args.model_path,
             trust_remote_code=True,
             gpu_memory_utilization=args.gpu_memory_utilization,
             max_model_len=4096,
             tensor_parallel_size=1,
-            dtype="bfloat16"
+            dtype=dtype_setting,
+            quantization=args.quantization,     # 支持 AWQ
+            speculative_config=speculative_config # 支持 EAGLE
         )
         tokenizer = llm.get_tokenizer()
         
@@ -203,31 +233,22 @@ def main():
         if config_idx == -1:
             mode_name = "Baseline (Zero-shot)"
             for raw_p in eval_prompts:
-                # 原始问题仍需使用 process_prompt 处理 (添加 Instruction 等)
                 final_p = process_prompt(raw_p, args.dataset)
                 current_prompts.append(final_p)
         else:
             if args.compare_mode == 'rank_specific':
-                # 模式 A: 仅使用第 K 个检索结果
                 mode_name = f"RAG (Rank {config_idx})"
                 for i, raw_p in enumerate(eval_prompts):
                     retrieved_texts = retrieval_cache[i]
-                    # 取出拼接好的 Context (Prompt + Target)
                     context = retrieved_texts[config_idx] if len(retrieved_texts) > config_idx else ""
-                    
-                    # 处理原始问题
                     base_p = process_prompt(raw_p, args.dataset)
-                    # 组合 RAG Prompt
                     final_p = construct_rag_prompt(base_p, context)
                     current_prompts.append(final_p)
             else:
-                # 模式 B: 拼接前 K 个结果
                 mode_name = f"RAG (Concat Top-{config_idx+1})"
                 for i, raw_p in enumerate(eval_prompts):
                     retrieved_texts = retrieval_cache[i]
-                    # 用双换行分隔多个 example
                     concat_context = "\n\n".join(retrieved_texts[:config_idx+1])
-                    
                     base_p = process_prompt(raw_p, args.dataset)
                     final_p = construct_rag_prompt(base_p, concat_context)
                     current_prompts.append(final_p)
@@ -240,21 +261,35 @@ def main():
             messages = [{"role": "user", "content": p}]
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             chat_prompts.append(text)
+        for i, p in enumerate(chat_prompts):
+            print(f"Prompt {i}:\n{p}\n{'-'*30}")
             
         # --- vLLM 批量推理 ---
-        start_gen = time.perf_counter()
-        outputs = llm.generate(chat_prompts, sampling_params, use_tqdm=True)
-        end_gen = time.perf_counter()
-        
-        total_time = end_gen - start_gen
+        batch_size=args.batch_size if args.batch_size else -1
+        if batch_size<0:
+            # vLLM 自动处理 Continuous Batching，无需手动并行循环
+            start_gen = time.perf_counter()
+            outputs = llm.generate(chat_prompts, sampling_params, use_tqdm=True)
+            end_gen = time.perf_counter()
+            total_time = end_gen - start_gen
+            # --- 提取结果 ---
+            generated_texts = [output.outputs[0].text.strip() for output in outputs]
+        else:
+            generated_texts = []
+            total_time = 0
+            for batch_start in range(0, len(chat_prompts), batch_size):
+                batch_prompts = chat_prompts[batch_start:batch_start + batch_size]
+                start_gen = time.perf_counter()
+                outputs = llm.generate(batch_prompts, sampling_params, use_tqdm=False)
+                end_gen = time.perf_counter()
+                total_time += (end_gen - start_gen)
+                generated_texts.extend([output.outputs[0].text.strip() for output in outputs])
+
+
         avg_time = total_time / len(chat_prompts)
-        
-        # --- 提取结果 ---
-        generated_texts = [output.outputs[0].text.strip() for output in outputs]
-        
-        print(f"  -> 样例输入: {chat_prompts[0][-200:]}...") # 打印最后一部分查看拼接效果
+        print(f"  -> 样例输入: {chat_prompts[0][-200:]}...") 
         print(f"  -> 样例输出: {generated_texts[0][:100]}...")
-        print(f"  -> 平均耗时: {avg_time:.4f}s")
+        print(f"  -> 平均耗时: {avg_time:.4f}s (Total: {total_time:.2f}s)")
         
         # --- 存储 ---
         stats_storage[config_idx] = {
