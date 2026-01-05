@@ -858,47 +858,111 @@ def process_retrieved_kickstart_text(retrieved_kickstart_text: str, dataset_name
 
 
 
-def load_evaluation_metrics(dataset_name: str) -> Dict[str, object]:
-    """
-    根据数据集类型加载所需的评估指标。
+# def load_evaluation_metrics(dataset_name: str) -> Dict[str, object]:
+#     """
+#     根据数据集类型加载所需的评估指标。
     
-    参数:
-        dataset_name: 数据集名称
+#     参数:
+#         dataset_name: 数据集名称
     
-    返回:
-        Dict[str, object]: 指标名称到 evaluate 库指标对象的映射
+#     返回:
+#         Dict[str, object]: 指标名称到 evaluate 库指标对象的映射
+#     """
+#     print("\n[加载评估指标]")
+#     metric_objs = {}
+#     start_time = time.time()
+#     try:
+#         if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'rocstories', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
+#             # metric_objs['rouge'] = evaluate.load('rouge')
+#             metric_objs['rouge'] = evaluate.load('../evaluate/metrics/rouge')
+#             print("  ✓ ROUGE 加载成功")
+        
+#         if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'rocstories', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
+#             # metric_objs['bertscore'] = evaluate.load("bertscore")
+#             metric_objs['bertscore'] = evaluate.load("../evaluate/metrics/bertscore")
+#             print("  ✓ BERTScore 加载成功")
+        
+#         if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
+#             # metric_objs['bleu'] = evaluate.load('bleu')
+#             metric_objs['bleu'] = evaluate.load('../evaluate/metrics/bleu')
+#             print("  ✓ BLEU 加载成功")
+            
+#         if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'qqp', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
+#             # metric_objs['meteor'] = evaluate.load('meteor')
+#             metric_objs['meteor'] = evaluate.load('../evaluate/metrics/meteor')
+#             print("  ✓ METEOR 加载成功")
+            
+#         if dataset_name in ['mbpp','humaneval']:
+#             # metric_objs['pass@1'] = evaluate.load('code_eval')
+#             metric_objs['pass@1'] = evaluate.load('../evaluate/metrics/code_eval')
+#             os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+#             print("  ✓ pass@1 加载成功")
+#         elapsed_time = time.time() - start_time
+#         print(f"\033[1;32m   -> 加载评估指标必要模型总耗时: {elapsed_time:.2f}s\033[0m")
+#     except Exception as e:
+#         print(f"  ✗ 加载警告: {e}")
+    
+#     return metric_objs
+
+
+def load_evaluation_metrics(dataset_name: str, device: str = 'cuda') -> Dict[str, object]:
     """
-    print("\n[加载评估指标]")
+    加载原生评估对象，替代 evaluate 库的慢速加载。
+    """
+    print(f"\n[加载评估指标] 针对数据集: {dataset_name}")
     metric_objs = {}
     start_time = time.time()
-    try:
-        if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'rocstories', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
-            metric_objs['rouge'] = evaluate.load('rouge')
-            print("  ✓ ROUGE 加载成功")
-        
-        if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'rocstories', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
-            metric_objs['bertscore'] = evaluate.load("bertscore")
-            print("  ✓ BERTScore 加载成功")
-        
-        if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
-            metric_objs['bleu'] = evaluate.load('bleu')
-            print("  ✓ BLEU 加载成功")
-            
-        if dataset_name in ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'qqp', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']:
-            metric_objs['meteor'] = evaluate.load('meteor')
-            print("  ✓ METEOR 加载成功")
-            
-        if dataset_name in ['mbpp','humaneval']:
-            metric_objs['pass@1'] = evaluate.load('code_eval')
-            os.environ["HF_ALLOW_CODE_EVAL"] = "1"
-            print("  ✓ pass@1 加载成功")
-        elapsed_time = time.time() - start_time
-        print(f"\033[1;32m   -> 加载评估指标必要模型总耗时: {elapsed_time:.2f}s\033[0m")
-    except Exception as e:
-        print(f"  ✗ 加载警告: {e}")
-    
-    return metric_objs
 
+    # 定义数据集分组 (保持你原有的逻辑)
+    group_nlp_all = ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'rocstories', 'qqp', 'alpaca', 'dolly', 'sharegpt', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']
+    group_bleu_meteor = ['nq_open', 'webquestions', 'dailydialog', 'e2e', 'qqp', 'commongen', 'wmt14', 'dailymail', 'bitext_customer', 'ecommerce', 'multiwoz', 'ms_marco', 'openorca']
+    group_code = ['mbpp', 'humaneval']
+
+    try:
+        # 1. 加载 ROUGE (原生 rouge-score)
+        if dataset_name in group_nlp_all:
+            # 实例化打分器，计算 rouge1, rouge2, rougeL
+            from rouge_score import rouge_scorer
+            metric_objs['rouge'] = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+            print("  ✓ ROUGE (Native) 准备就绪")
+
+        # 2. 加载 BERTScore (原生 bert_score)
+        if dataset_name in group_nlp_all:
+            # 替换为你本地的模型路径，如果没有本地模型，它会自动下载一次 roberta-large
+            model_path = "/home/lyz/.cache/huggingface/hub/models--roberta-large/snapshots/722cf37b1afa9454edce342e7895e588b6ff1d59" 
+            if not os.path.exists(model_path):
+                model_path = "roberta-large" # 回退到在线加载
+
+            # 提前加载模型到显存，避免推理时重复加载
+            from bert_score import BERTScorer
+            metric_objs['bertscore'] = BERTScorer(model_type=model_path, device=device, num_layers=17)
+            print("  ✓ BERTScore (Native) 模型加载完成")
+
+        # 3. 加载 BLEU (原生 sacrebleu，无需实例化对象，存个标记即可)
+        if dataset_name in group_nlp_all: # 注意：你原逻辑中 bleu 的范围和 rouge 一样
+            metric_objs['bleu'] = True 
+            print("  ✓ BLEU (SacreBLEU) 准备就绪")
+
+        # 4. 加载 METEOR (原生 NLTK，无需实例化对象，存个标记即可)
+        if dataset_name in group_bleu_meteor:
+            metric_objs['meteor'] = True
+            print("  ✓ METEOR (NLTK) 准备就绪")
+
+        # 5. 加载 Pass@1 (保留 evaluate，这是唯一没办法简化的)
+        if dataset_name in group_code:
+            # 这里还是得用 evaluate，因为涉及到代码沙箱执行
+            # 建议指向本地路径 ./evaluate/metrics/code_eval/code_eval.py
+            metric_objs['pass@1'] = evaluate.load("code_eval") 
+            os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+            print("  ✓ pass@1 (Evaluate) 加载成功")
+
+        elapsed_time = time.time() - start_time
+        print(f"\033[1;32m   -> 指标加载总耗时: {elapsed_time:.2f}s\033[0m")
+        return metric_objs
+
+    except Exception as e:
+        print(f"  ✗ 指标加载失败: {e}")
+        return {}
 
 
 
@@ -918,7 +982,7 @@ SUPPORTED_DATASETS = [
 if __name__ == "__main__":
     # 测试 GPQA 数据集处理
     dataset_name = "banking77"
-    base_path = "/root/autodl-tmp/datasets"  # 根据你的实际路径调整
+    base_path = "/home/lyz/DLM/datasets"  # 根据你的实际路径调整
     prompts, targets = load_and_process_dataset(dataset_name, base_path)
     print("样例 Prompt：")
     print(prompts[0])

@@ -2,19 +2,19 @@ import time
 import os
 # os.environ["VLLM_USE_V1"] = "0"
 # os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
 from vllm import LLM, SamplingParams
 
 # --- 配置路径 (保持不变) ---
-# MODEL_PATH = "/root/autodl-tmp/model/Llama-3.1-8B-Instruct"
-# DRAFT_MODEL_PATH = "/root/autodl-tmp/model/EAGLE-LLaMA3.1-Instruct-8B"
+# MODEL_PATH = "/backup01/DLM/model/Llama-3.1-8B-Instruct"
+# DRAFT_MODEL_PATH = "/backup01/DLM/model/EAGLE-LLaMA3.1-Instruct-8B"
 
 
-MODEL_PATH = "/root/autodl-tmp/model/Qwen2.5-7B-Instruct"
-# DRAFT_MODEL_PATH = "/root/autodl-tmp/model/EAGLE-Qwen2.5-7B-Instruct"
+MODEL_PATH = "/backup01/DLM/model/Qwen2.5-7B-Instruct"
+# DRAFT_MODEL_PATH = "/backup01/DLM/model/EAGLE-Qwen2.5-7B-Instruct"
 
-# MODEL_PATH = "/root/autodl-tmp/model/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
-# MODEL_PATH = "/root/autodl-tmp/model/Qwen2.5-7B-Instruct-AWQ"
+# MODEL_PATH = "/backup01/DLM/model/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+# MODEL_PATH = "/backup01/DLM/model/Qwen2.5-7B-Instruct-AWQ"
 
 def main():
     # 1. 初始化引擎 (保持不变)

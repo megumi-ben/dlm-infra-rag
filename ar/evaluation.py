@@ -172,43 +172,118 @@ def calc_f1(predictions: List[str], references: Union[List[str], List[List[str]]
     return np.mean(f1_scores)
 
 
+# def calc_rouge_l(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, **kwargs) -> float:
+#     """计算 ROUGE-L 指标"""
+#     if metric_objs and 'rouge' in metric_objs:
+#         rouge_res = metric_objs['rouge'].compute(predictions=predictions, references=references)
+#         return rouge_res['rougeL']
+#     return 0.0
+
+
+# def calc_bleu(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, **kwargs) -> float:
+#     """计算 BLEU 指标"""
+#     if metric_objs and 'bleu' in metric_objs:
+#         bleu_res = metric_objs['bleu'].compute(predictions=predictions, references=references)
+#         return bleu_res['bleu']
+#     return 0.0
+
+
+# def calc_meteor(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, **kwargs) -> float:
+#     """计算 METEOR 指标"""
+#     if metric_objs and 'meteor' in metric_objs:
+#         meteor_res = metric_objs['meteor'].compute(predictions=predictions, references=references)
+#         return meteor_res['meteor']
+#     return 0.0
+
+
+# def calc_bertscore(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, device: str = 'cuda', **kwargs) -> float:
+#     """计算 BERTScore 指标"""
+#     if metric_objs and 'bertscore' in metric_objs:
+#         try:
+#             bert_res = metric_objs['bertscore'].compute(
+#                 predictions=predictions, references=references, 
+#                 lang="en", device=device, batch_size=32
+#             )
+#             return np.mean(bert_res['f1'])
+#         except Exception as e:
+#             print(f"[Warning] BERTScore calculation failed: {e}")
+#     return 0.0
+
+
 def calc_rouge_l(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, **kwargs) -> float:
-    """计算 ROUGE-L 指标"""
+    """计算 ROUGE-L 指标 (Native)"""
     if metric_objs and 'rouge' in metric_objs:
-        rouge_res = metric_objs['rouge'].compute(predictions=predictions, references=references)
-        return rouge_res['rougeL']
+        scorer = metric_objs['rouge'] # 获取 RougeScorer 对象
+        scores = []
+        for p, r in zip(predictions, references):
+            # 处理多参考答案的情况，通常取第一个或拼在一起
+            ref_text = r[0] if isinstance(r, list) else r
+            # score 返回一个字典，包含 precision, recall, fmeasure
+            scores.append(scorer.score(ref_text, p)['rougeL'].fmeasure)
+        return np.mean(scores)
     return 0.0
 
 
 def calc_bleu(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, **kwargs) -> float:
-    """计算 BLEU 指标"""
+    """计算 BLEU 指标 (SacreBLEU)"""
     if metric_objs and 'bleu' in metric_objs:
-        bleu_res = metric_objs['bleu'].compute(predictions=predictions, references=references)
-        return bleu_res['bleu']
+        # SacreBLEU 期望 references 是 List[List[str]] (多个参考列表)，
+        # 且结构是 [[ref1_doc1, ref1_doc2], [ref2_doc1, ref2_doc2]]
+        # 这里的转换非常关键
+        
+        formatted_refs = []
+        # 假设每个 prediction 只有一个 reference，或者 references 已经是列表
+        if isinstance(references[0], str):
+            formatted_refs = [[r for r in references]] # 包装成 List[List]
+        else:
+            # 如果 references 已经是 List[List]，需要转置
+            # 比如 100 个样本，每个样本 1 个参考 -> [[ref1], [ref2]...] -> 转置为 [[ref1, ref2...]]
+            formatted_refs = list(map(list, zip(*references)))
+
+        # use_effective_order 使得短句子也不会得 0 分
+        import sacrebleu
+        bleu = sacrebleu.corpus_bleu(predictions, formatted_refs)
+        return bleu.score
     return 0.0
 
 
 def calc_meteor(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, **kwargs) -> float:
-    """计算 METEOR 指标"""
+    """计算优化后的 METEOR 指标"""
     if metric_objs and 'meteor' in metric_objs:
-        meteor_res = metric_objs['meteor'].compute(predictions=predictions, references=references)
-        return meteor_res['meteor']
+        from nltk.translate.meteor_score import meteor_score
+        from nltk.tokenize import word_tokenize
+        import numpy as np
+
+        scores = []
+        for p, r in zip(predictions, references):
+            # 1. 使用 word_tokenize 替代 .split()，这会处理标点符号
+            # 确保输入是小写化，因为 METEOR 通常对大小写敏感
+            pred_tokens = word_tokenize(p.lower())
+            
+            ref_list = r if isinstance(r, list) else [r]
+            ref_tokens = [word_tokenize(ref.lower()) for ref in ref_list]
+            
+            # 2. 计算分数
+            scores.append(meteor_score(ref_tokens, pred_tokens))
+            
+        return np.mean(scores) if scores else 0.0
     return 0.0
 
 
 def calc_bertscore(predictions: List[str], references: Union[List[str], List[List[str]]], metric_objs: Dict = None, device: str = 'cuda', **kwargs) -> float:
-    """计算 BERTScore 指标"""
+    """计算 BERTScore 指标 (Native)"""
     if metric_objs and 'bertscore' in metric_objs:
         try:
-            bert_res = metric_objs['bertscore'].compute(
-                predictions=predictions, references=references, 
-                lang="en", device=device, batch_size=32
-            )
-            return np.mean(bert_res['f1'])
+            scorer = metric_objs['bertscore']
+            # 处理 references 格式
+            flat_refs = [r[0] if isinstance(r, list) else r for r in references]
+            
+            # BERTScorer 直接支持 list 输入
+            P, R, F1 = scorer.score(predictions, flat_refs)
+            return F1.mean().item()
         except Exception as e:
             print(f"[Warning] BERTScore calculation failed: {e}")
     return 0.0
-
 
 def calc_dist_1(predictions: List[str], references: List[str] = None, **kwargs) -> float:
     """计算 Distinct-1 指标"""
@@ -273,7 +348,7 @@ def calc_self_bleu(predictions: List[str], references: List[str] = None, n_gram:
 
 
 def calc_gen_ppl(predictions: List[str], references: List[str] = None, 
-                 model_id: str = '/root/autodl-tmp/model/models--distilbert--distilgpt2/snapshots/2290a62682d06624634c1f46a6ad5be0f47f38aa', 
+                 model_id: str = '/backup01/DLM/model/distilgpt2', 
                  device: str = 'cuda', **kwargs) -> float:
     """计算生成困惑度 (Gen-PPL)"""
     if not predictions:
@@ -291,7 +366,14 @@ def calc_gen_ppl(predictions: List[str], references: List[str] = None,
             if not text.strip():
                 continue
             
-            encodings = tokenizer(text, return_tensors='pt')
+            # encodings = tokenizer(text, return_tensors='pt')
+            # --- 修改后的代码 ---
+            encodings = tokenizer(
+                text, 
+                return_tensors='pt', 
+                truncation=True,          # 开启截断
+                max_length=1024           # 强制限制在模型的最大长度以内
+            )
             input_ids = encodings.input_ids.to(device)
             
             if input_ids.size(1) < 2:
@@ -333,9 +415,9 @@ def calc_mauve(predictions: List[str], references: List[str], device: str = 'cud
             mauve_out = compute_mauve(
                 p_text=list(valid_refs),
                 q_text=list(valid_preds),
-                featurize_model_name='/root/autodl-tmp/model/models--distilbert--distilgpt2/snapshots/2290a62682d06624634c1f46a6ad5be0f47f38aa',
+                featurize_model_name='/backup01/DLM/model/distilgpt2',
                 device_id=device_id,
-                max_text_length=256,
+                max_text_length=1024,
                 verbose=False
             )
             return mauve_out.mauve

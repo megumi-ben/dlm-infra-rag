@@ -1,10 +1,43 @@
-# 说明
+# note
 
-rag_engine.py 是rag技术相关，负责知识库构建、检索，可以切换嵌入模型和重排序模型。
-data_processor.py 是数据集的处理相关，加载、处理相关逻辑。
-evaluation.py 是评估指标计算相关逻辑。
-mix.py 是DLM模型和rag技术检索草稿热启动相关逻辑，也是主流程入口，核心是initialize_with_kickstart.
-chat_ar.py 是使用vllm框架和AR模型进行对话的示例代码。
+chat.py 是和自回归模型对话的最简单示例（qwen、llama）
+vllm_chat.py 是使用vllm框架和大模型简单的示例.
+parallel_vllm_chat.py 是使用vllm框架和大模型并行批量对话的示例
+serial_vllm_chat.py 是使用vllm框架和大模型逐一串行对话的示例
+mix_ar.py 是主流程，加载模型使用数据集进行评测，最后计算指标。
 
-我的项目逻辑是DLM推理加速，思想是rag技术检索草稿作为draft作为DLM推理的热启动，从而减少推理步数。其中baseline使用qwen和llama进行对比，这两个ar模型也将和rag技术（就是普通的rag技术，放到prompt中，不mask）结合，作为对比存在。
-目前要实现的就是AR模型结合rag技术以及评估指标的计算（主流程实现），请给出实现代码。可以参考mix.py以及chat_ar.py
+重点是 parallel_vllm_chat 以及 mix_ar
+
+## 特性
+
+可以使用flashinfer
+
+```python
+os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+os.environ["TORCH_CUDA_ARCH_LIST"] = "8.6"
+```
+
+可以使用eagle投机解码
+
+```python
+# DRAFT_MODEL_PATH = "/backup01/DLM/model/EAGLE-LLaMA3.1-Instruct-8B"
+speculative_config={
+    "method": "eagle",
+    "model": DRAFT_MODEL_PATH, # 指向这个小权重
+    "num_speculative_tokens": 5,
+},
+```
+
+可以使用 awq 权重量化版本
+
+```python
+quantization="awq",  # 显式指定 AWQ
+dtype="auto",      # 必须设为 auto
+
+# MODEL_PATH = "/backup01/DLM/model/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+# MODEL_PATH = "/backup01/DLM/model/Qwen2.5-7B-Instruct-AWQ"
+```
+
+## 要求
+
+现在mix_ar.py中只有简单的vllm框架下面的大模型加上我的rag检索草稿热启动技术，没有融合 parallel_vllm_chat.py 中的falshinfer、eagle投机解码、awq权重量化，请帮我完成完整的mix_ar.py.
